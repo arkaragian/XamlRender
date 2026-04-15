@@ -5,6 +5,7 @@ This repository contains a WPF renderer prototype that loads a `.xaml` file and 
 ## Current State
 
 - Main implementation lives in `XamlRender/Program.cs`.
+- Command-line parsing now uses `System.CommandLine` (`System.CommandLine` package version `2.0.0` in `XamlRender.csproj`).
 - The renderer supports:
   - compiled WPF `UserControl` / `FrameworkElement` loading via `x:Class`
   - loose XAML loading when `x:Class` is absent
@@ -34,6 +35,13 @@ This repository contains a WPF renderer prototype that loads a `.xaml` file and 
   - `path(line,column): error: message`
   - `path: warning: message`
 - When WPF does not provide file/line information, diagnostics fall back to the input XAML path.
+
+- The CLI shape is currently:
+  - `XamlRender.exe <xaml> <output>`
+  - `XamlRender.exe <xaml> --preview`
+- `output` is optional at the parser level but runtime validation requires either:
+  - an output path, or
+  - `--preview`
 
 ## Output Notes
 
@@ -75,6 +83,8 @@ This repository contains a WPF renderer prototype that loads a `.xaml` file and 
   - raster wrapped in another container
 
 - Treat diagnostic output as part of the tool contract now. Future changes should preserve machine-readable `stderr` lines because the intended downstream use includes Neovim quickfix/jumplist integration.
+
+- Treat the `System.CommandLine` command surface as part of the tool contract as well. If the CLI evolves, preserve backward compatibility unless there is a strong reason not to.
 
 - If you expand diagnostics further, prefer:
   - stable one-line records

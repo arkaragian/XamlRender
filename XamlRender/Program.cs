@@ -2,12 +2,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.CommandLine;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using System.Windows.Xps;
 using System.Windows.Xps.Packaging;
 using System.Xaml;
@@ -31,21 +33,68 @@ internal static class Program {
     /// <param name="args">Command-line arguments containing the input XAML path and output path.</param>
     [STAThread]
     private static int Main(string[] args) {
-        if (args.Length < 2) {
-            Console.WriteLine("Usage: XamlRender.exe input.xaml output.png|output.xps|output.svg");
-            return 1;
-        }
+        RootCommand rootCommand = BuildRootCommand();
+        ParseResult parseResult = rootCommand.Parse(args);
+        return parseResult.Invoke();
+    }
 
-        string xamlPath = Path.GetFullPath(args[0]);
-        string outputPath = Path.GetFullPath(args[1]);
+    /// <summary>
+    /// Creates the command-line surface for rendering or previewing a XAML file.
+    /// </summary>
+    /// <returns>The configured root command.</returns>
+    private static RootCommand BuildRootCommand() {
+        Argument<string> xamlPathArgument = new("xaml") {
+            Description = "Path to the XAML file to load.",
+        };
+        Argument<string?> outputPathArgument = new("output") {
+            Description = "Output path for .png, .xps, or .svg rendering.",
+            Arity = ArgumentArity.ZeroOrOne,
+            DefaultValueFactory = _ => null,
+        };
+        Option<bool> previewOption = new("--preview") {
+            Description = "Open a preview window instead of writing an output file.",
+        };
 
-        using WpfDiagnosticsSession diagnostics = StartDiagnosticsSession(xamlPath);
+        RootCommand rootCommand = new("Render or preview a WPF XAML file.");
+        rootCommand.Add(xamlPathArgument);
+        rootCommand.Add(outputPathArgument);
+        rootCommand.Add(previewOption);
+
+        rootCommand.SetAction(parseResult => {
+            string xamlPath = parseResult.GetRequiredValue(xamlPathArgument);
+            string? outputPath = parseResult.GetValue(outputPathArgument);
+            bool previewMode = parseResult.GetValue(previewOption);
+            return ExecuteRender(xamlPath, outputPath, previewMode);
+        });
+
+        return rootCommand;
+    }
+
+    /// <summary>
+    /// Executes the requested render or preview operation.
+    /// </summary>
+    /// <param name="xamlPath">The source XAML path.</param>
+    /// <param name="outputPath">The optional output path.</param>
+    /// <param name="previewMode">Whether preview mode is enabled.</param>
+    private static int ExecuteRender(string xamlPath, string? outputPath, bool previewMode) {
+        string normalizedXamlPath = Path.GetFullPath(xamlPath);
+        string? normalizedOutputPath = outputPath is null ? null : Path.GetFullPath(outputPath);
+
+        using WpfDiagnosticsSession diagnostics = StartDiagnosticsSession(normalizedXamlPath);
 
         try {
-            WriteStatus($"Loading '{xamlPath}'.");
-            FrameworkElement element = LoadRootElement(xamlPath);
-            WriteStatus($"Rendering '{outputPath}'.");
-            Render(element, outputPath);
+            WriteStatus($"Loading '{normalizedXamlPath}'.");
+            FrameworkElement element = LoadRootElement(normalizedXamlPath);
+
+            if (previewMode) {
+                WriteStatus("Opening preview window.");
+                ShowPreviewWindow(element, normalizedXamlPath);
+            }
+            else {
+                WriteStatus($"Rendering '{normalizedOutputPath}'.");
+                Render(element, normalizedOutputPath!);
+            }
+
             WriteStatus("Done.");
             return 0;
         }
@@ -564,6 +613,38 @@ internal static class Program {
         throw new InvalidOperationException(
             $"Unsupported output format '{extension}'. Supported formats are .png, .xps, and .svg."
         );
+    }
+
+    /// <summary>
+    /// Displays the loaded framework element in a preview window.
+    /// </summary>
+    /// <param name="element">The visual root to preview.</param>
+    /// <param name="xamlPath">The source XAML path, used for the window title.</param>
+    private static void ShowPreviewWindow(FrameworkElement element, string xamlPath) {
+        Size renderSize = PrepareElementForRendering(element);
+        Application application = Application.Current ?? new Application();
+
+        ScrollViewer viewer = new() {
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = element,
+        };
+
+        Window previewWindow = new() {
+            Title = $"XamlRender Preview - {Path.GetFileName(xamlPath)}",
+            Content = viewer,
+            SizeToContent = SizeToContent.WidthAndHeight,
+            MinWidth = Math.Min(renderSize.Width + 40, 400),
+            MinHeight = Math.Min(renderSize.Height + 60, 300),
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+        };
+
+        previewWindow.Closed += (_, _) => Dispatcher.CurrentDispatcher.BeginInvokeShutdown(
+            DispatcherPriority.Background
+        );
+
+        previewWindow.Show();
+        Dispatcher.Run();
     }
 
     /// <summary>
