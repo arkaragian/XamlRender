@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -17,23 +18,41 @@ internal static class Program {
     private static readonly HashSet<string> AssemblyProbeDirectories = new(
         StringComparer.OrdinalIgnoreCase
     );
+    private static readonly string[] WpfDiagnosticSourceNames = [
+        "DataBindingSource",
+        "DependencyPropertySource",
+        "MarkupSource",
+        "ResourceDictionarySource",
+    ];
 
     /// <summary>
     /// Entry point for the renderer executable.
     /// </summary>
     /// <param name="args">Command-line arguments containing the input XAML path and output path.</param>
     [STAThread]
-    private static void Main(string[] args) {
+    private static int Main(string[] args) {
         if (args.Length < 2) {
             Console.WriteLine("Usage: XamlRender.exe input.xaml output.png|output.xps|output.svg");
-            return;
+            return 1;
         }
 
         string xamlPath = Path.GetFullPath(args[0]);
         string outputPath = Path.GetFullPath(args[1]);
 
-        FrameworkElement element = LoadRootElement(xamlPath);
-        Render(element, outputPath);
+        using WpfDiagnosticsSession diagnostics = StartDiagnosticsSession(xamlPath);
+
+        try {
+            WriteStatus($"Loading '{xamlPath}'.");
+            FrameworkElement element = LoadRootElement(xamlPath);
+            WriteStatus($"Rendering '{outputPath}'.");
+            Render(element, outputPath);
+            WriteStatus("Done.");
+            return 0;
+        }
+        catch (Exception exception) {
+            diagnostics.ReportException(exception);
+            return 1;
+        }
     }
 
     /// <summary>
@@ -45,14 +64,18 @@ internal static class Program {
         string? xamlClassName = TryReadXamlClassName(xamlPath);
 
         if (string.IsNullOrWhiteSpace(xamlClassName)) {
+            WriteStatus("No x:Class found. Using loose XAML loader.");
             return LoadLooseXaml(xamlPath);
         }
 
+        WriteStatus($"Resolved x:Class '{xamlClassName}'.");
+        WriteStatus("Locating owning project.");
         string? projectPath = FindOwningProject(xamlPath);
         if (projectPath is null) {
             throw new InvalidOperationException($"Unable to find a WPF project for '{xamlPath}'.");
         }
 
+        WriteStatus($"Using project '{projectPath}'.");
         string assemblyPath = BuildProjectAndGetAssemblyPath(projectPath);
         InitializeApplicationResources(projectPath, assemblyPath);
         return InstantiateCompiledRoot(assemblyPath, xamlClassName);
@@ -206,6 +229,7 @@ internal static class Program {
     /// <param name="projectPath">The path to the project file to build.</param>
     /// <returns>The absolute path to the built assembly.</returns>
     private static string BuildProjectAndGetAssemblyPath(string projectPath) {
+        WriteStatus($"Building project '{projectPath}'.");
         RunDotnet($"build \"{projectPath}\" -c Debug -nologo");
 
         XDocument document = XDocument.Load(projectPath);
@@ -243,6 +267,7 @@ internal static class Program {
             );
         }
 
+        WriteStatus($"Build output '{assemblyPath}'.");
         return assemblyPath;
     }
 
@@ -252,15 +277,18 @@ internal static class Program {
     /// <param name="projectPath">The path to the owning project file.</param>
     /// <param name="assemblyPath">The path to the built assembly.</param>
     private static void InitializeApplicationResources(string projectPath, string assemblyPath) {
+        WriteStatus("Initializing application resources.");
         RegisterAssemblyProbeDirectory(assemblyPath);
         Assembly assembly = LoadAssemblyIntoDefaultContext(assemblyPath);
         string? appXamlPath = FindApplicationDefinitionPath(projectPath);
 
         if (appXamlPath is not null) {
+            WriteStatus($"Found application definition '{appXamlPath}'.");
             string? appClassName = TryReadXamlClassName(appXamlPath);
             if (!string.IsNullOrWhiteSpace(appClassName)) {
                 Type? appType = assembly.GetType(appClassName, throwOnError: false, ignoreCase: false);
                 if (appType is not null && typeof(Application).IsAssignableFrom(appType)) {
+                    WriteStatus($"Initializing application type '{appType.FullName}'.");
                     Application application = EnsureApplicationInstance(appType);
                     InvokeInitializeComponentIfPresent(application);
                     return;
@@ -268,6 +296,7 @@ internal static class Program {
             }
         }
 
+        WriteStatus("No compiled application type found. Using default Application instance.");
         _ = Application.Current ?? new Application();
     }
 
@@ -304,6 +333,7 @@ internal static class Program {
     /// <param name="xamlClassName">The fully qualified root type name from <c>x:Class</c>.</param>
     /// <returns>The instantiated framework element.</returns>
     private static FrameworkElement InstantiateCompiledRoot(string assemblyPath, string xamlClassName) {
+        WriteStatus($"Instantiating '{xamlClassName}'.");
         RegisterAssemblyProbeDirectory(assemblyPath);
         Assembly assembly = LoadAssemblyIntoDefaultContext(assemblyPath);
         Type? rootType = assembly.GetType(xamlClassName, throwOnError: false, ignoreCase: false);
@@ -514,16 +544,19 @@ internal static class Program {
         string extension = Path.GetExtension(outputPath);
 
         if (string.Equals(extension, ".png", StringComparison.OrdinalIgnoreCase)) {
+            WriteStatus("Rendering PNG output.");
             RenderToPng(element, outputPath);
             return;
         }
 
         if (string.Equals(extension, ".xps", StringComparison.OrdinalIgnoreCase)) {
+            WriteStatus("Rendering XPS output.");
             RenderToXps(element, outputPath);
             return;
         }
 
         if (string.Equals(extension, ".svg", StringComparison.OrdinalIgnoreCase)) {
+            WriteStatus("Rendering SVG output.");
             RenderToSvg(element, outputPath);
             return;
         }
@@ -634,5 +667,206 @@ internal static class Program {
         using MemoryStream stream = new();
         encoder.Save(stream);
         return stream.ToArray();
+    }
+
+    /// <summary>
+    /// Writes a user-visible status line describing the current render stage.
+    /// </summary>
+    /// <param name="message">The progress message to emit.</param>
+    private static void WriteStatus(string message) {
+        Console.Error.WriteLine($"[status] {message}");
+    }
+
+    /// <summary>
+    /// Starts WPF diagnostic capture for warnings and errors.
+    /// </summary>
+    /// <param name="xamlPath">The XAML path currently being rendered.</param>
+    /// <returns>A disposable diagnostic session.</returns>
+    private static WpfDiagnosticsSession StartDiagnosticsSession(string xamlPath) {
+        WpfDiagnosticsListener listener = new(xamlPath);
+        List<TraceSource> attachedSources = [];
+
+        foreach (string sourceName in WpfDiagnosticSourceNames) {
+            PropertyInfo? property = typeof(PresentationTraceSources).GetProperty(
+                sourceName,
+                BindingFlags.Public | BindingFlags.Static
+            );
+
+            if (property?.GetValue(null) is not TraceSource traceSource) {
+                continue;
+            }
+
+            traceSource.Switch.Level = SourceLevels.Warning;
+            traceSource.Listeners.Add(listener);
+            attachedSources.Add(traceSource);
+        }
+
+        return new WpfDiagnosticsSession(listener, attachedSources);
+    }
+}
+
+internal sealed class WpfDiagnosticsSession : IDisposable {
+    private readonly WpfDiagnosticsListener listener;
+    private readonly IReadOnlyList<TraceSource> attachedSources;
+
+    /// <summary>
+    /// Initializes a diagnostics session for WPF trace messages.
+    /// </summary>
+    /// <param name="listener">The listener receiving trace events.</param>
+    /// <param name="attachedSources">The trace sources that the listener was attached to.</param>
+    public WpfDiagnosticsSession(
+        WpfDiagnosticsListener listener,
+        IReadOnlyList<TraceSource> attachedSources
+    ) {
+        this.listener = listener;
+        this.attachedSources = attachedSources;
+    }
+
+    /// <summary>
+    /// Reports an exception in quickfix-friendly format when possible.
+    /// </summary>
+    /// <param name="exception">The exception to report.</param>
+    public void ReportException(Exception exception) {
+        Exception relevantException = exception is TargetInvocationException { InnerException: not null }
+            ? exception.InnerException
+            : exception;
+
+        if (relevantException is System.Windows.Markup.XamlParseException xamlParseException) {
+            listener.WriteException(xamlParseException);
+            return;
+        }
+
+        listener.WriteDiagnostic(
+            DiagnosticSeverity.Error,
+            listener.DefaultFilePath,
+            lineNumber: null,
+            columnNumber: null,
+            relevantException.Message
+        );
+    }
+
+    /// <inheritdoc />
+    public void Dispose() {
+        foreach (TraceSource traceSource in attachedSources) {
+            traceSource.Listeners.Remove(listener);
+        }
+    }
+}
+
+internal enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+internal sealed class WpfDiagnosticsListener : TraceListener {
+    private static readonly Regex FileLineColumnPattern = new(
+        @"(?<file>[A-Za-z]:\\[^:\r\n]+\.xaml)\((?<line>\d+),(?<column>\d+)\)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase
+    );
+
+    /// <summary>
+    /// Initializes a listener for WPF trace diagnostics.
+    /// </summary>
+    /// <param name="defaultFilePath">The XAML file currently being rendered.</param>
+    public WpfDiagnosticsListener(string defaultFilePath) {
+        DefaultFilePath = defaultFilePath;
+    }
+
+    /// <summary>
+    /// Gets the default XAML path used when diagnostics do not include a source file.
+    /// </summary>
+    public string DefaultFilePath { get; }
+
+    /// <inheritdoc />
+    public override void Write(string? message) { }
+
+    /// <inheritdoc />
+    public override void WriteLine(string? message) {
+        if (string.IsNullOrWhiteSpace(message)) {
+            return;
+        }
+
+        WriteDiagnosticFromText(DiagnosticSeverity.Warning, message);
+    }
+
+    /// <inheritdoc />
+    public override void TraceEvent(
+        TraceEventCache? eventCache,
+        string source,
+        TraceEventType eventType,
+        int id,
+        string? message
+    ) {
+        if (string.IsNullOrWhiteSpace(message)) {
+            return;
+        }
+
+        DiagnosticSeverity severity = eventType switch {
+            TraceEventType.Critical or TraceEventType.Error => DiagnosticSeverity.Error,
+            _ => DiagnosticSeverity.Warning,
+        };
+
+        WriteDiagnosticFromText(severity, message);
+    }
+
+    /// <summary>
+    /// Writes an exception using the best available file and line information.
+    /// </summary>
+    /// <param name="exception">The exception to report.</param>
+    public void WriteException(System.Windows.Markup.XamlParseException exception) {
+        string message = exception.InnerException?.Message ?? exception.Message;
+        int? lineNumber = exception.LineNumber > 0 ? exception.LineNumber : null;
+        int? columnNumber = exception.LinePosition > 0 ? exception.LinePosition : null;
+
+        WriteDiagnostic(
+            DiagnosticSeverity.Error,
+            DefaultFilePath,
+            lineNumber,
+            columnNumber,
+            message
+        );
+    }
+
+    /// <summary>
+    /// Writes a formatted diagnostic line.
+    /// </summary>
+    /// <param name="severity">The diagnostic severity.</param>
+    /// <param name="filePath">The file path associated with the diagnostic.</param>
+    /// <param name="lineNumber">The optional line number.</param>
+    /// <param name="columnNumber">The optional column number.</param>
+    /// <param name="message">The diagnostic message.</param>
+    public void WriteDiagnostic(
+        DiagnosticSeverity severity,
+        string filePath,
+        int? lineNumber,
+        int? columnNumber,
+        string message
+    ) {
+        string normalizedMessage = NormalizeMessage(message);
+        string location = lineNumber is not null && columnNumber is not null
+            ? $"{filePath}({lineNumber},{columnNumber})"
+            : filePath;
+
+        Console.Error.WriteLine($"{location}: {severity.ToString().ToLowerInvariant()}: {normalizedMessage}");
+    }
+
+    private void WriteDiagnosticFromText(DiagnosticSeverity severity, string message) {
+        Match match = FileLineColumnPattern.Match(message);
+
+        if (match.Success) {
+            string filePath = match.Groups["file"].Value;
+            int lineNumber = int.Parse(match.Groups["line"].Value);
+            int columnNumber = int.Parse(match.Groups["column"].Value);
+            string cleanMessage = message.Replace(match.Value, string.Empty, StringComparison.Ordinal).Trim();
+
+            WriteDiagnostic(severity, filePath, lineNumber, columnNumber, cleanMessage);
+            return;
+        }
+
+        WriteDiagnostic(severity, DefaultFilePath, null, null, message);
+    }
+
+    private static string NormalizeMessage(string message) {
+        return Regex.Replace(message.Trim(), @"\s+", " ");
     }
 }
