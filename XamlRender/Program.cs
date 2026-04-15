@@ -43,58 +43,78 @@ internal static class Program {
     /// </summary>
     /// <returns>The configured root command.</returns>
     private static RootCommand BuildRootCommand() {
-        Argument<string> xamlPathArgument = new("xaml") {
-            Description = "Path to the XAML file to load.",
+        Argument<string> previewXamlPathArgument = new("xaml") {
+            Description = "Path to the XAML file to preview.",
         };
-        Argument<string?> outputPathArgument = new("output") {
+        Argument<string> renderXamlPathArgument = new("xaml") {
+            Description = "Path to the XAML file to render.",
+        };
+        Argument<string> outputPathArgument = new("output") {
             Description = "Output path for .png, .xps, or .svg rendering.",
-            Arity = ArgumentArity.ZeroOrOne,
-            DefaultValueFactory = _ => null,
         };
-        Option<bool> previewOption = new("--preview") {
-            Description = "Open a preview window instead of writing an output file.",
-        };
+
+        Command previewCommand = new("preview", "Open a preview window for a XAML file.");
+        previewCommand.Add(previewXamlPathArgument);
+        previewCommand.SetAction(parseResult => {
+            string xamlPath = parseResult.GetRequiredValue(previewXamlPathArgument);
+            return ExecutePreview(xamlPath);
+        });
+
+        Command renderCommand = new("render", "Render a XAML file to an output file.");
+        renderCommand.Add(renderXamlPathArgument);
+        renderCommand.Add(outputPathArgument);
+        renderCommand.SetAction(parseResult => {
+            string xamlPath = parseResult.GetRequiredValue(renderXamlPathArgument);
+            string outputPath = parseResult.GetRequiredValue(outputPathArgument);
+            return ExecuteRender(xamlPath, outputPath);
+        });
 
         RootCommand rootCommand = new("Render or preview a WPF XAML file.");
-        rootCommand.Add(xamlPathArgument);
-        rootCommand.Add(outputPathArgument);
-        rootCommand.Add(previewOption);
-
-        rootCommand.SetAction(parseResult => {
-            string xamlPath = parseResult.GetRequiredValue(xamlPathArgument);
-            string? outputPath = parseResult.GetValue(outputPathArgument);
-            bool previewMode = parseResult.GetValue(previewOption);
-            return ExecuteRender(xamlPath, outputPath, previewMode);
-        });
+        rootCommand.Add(previewCommand);
+        rootCommand.Add(renderCommand);
 
         return rootCommand;
     }
 
     /// <summary>
-    /// Executes the requested render or preview operation.
+    /// Executes the requested render operation.
     /// </summary>
     /// <param name="xamlPath">The source XAML path.</param>
-    /// <param name="outputPath">The optional output path.</param>
-    /// <param name="previewMode">Whether preview mode is enabled.</param>
-    private static int ExecuteRender(string xamlPath, string? outputPath, bool previewMode) {
+    /// <param name="outputPath">The output path.</param>
+    private static int ExecuteRender(string xamlPath, string outputPath) {
         string normalizedXamlPath = Path.GetFullPath(xamlPath);
-        string? normalizedOutputPath = outputPath is null ? null : Path.GetFullPath(outputPath);
+        string normalizedOutputPath = Path.GetFullPath(outputPath);
 
         using WpfDiagnosticsSession diagnostics = StartDiagnosticsSession(normalizedXamlPath);
 
         try {
             WriteStatus($"Loading '{normalizedXamlPath}'.");
             FrameworkElement element = LoadRootElement(normalizedXamlPath);
+            WriteStatus($"Rendering '{normalizedOutputPath}'.");
+            Render(element, normalizedOutputPath);
+            WriteStatus("Done.");
+            return 0;
+        }
+        catch (Exception exception) {
+            diagnostics.ReportException(exception);
+            return 1;
+        }
+    }
 
-            if (previewMode) {
-                WriteStatus("Opening preview window.");
-                ShowPreviewWindow(element, normalizedXamlPath);
-            }
-            else {
-                WriteStatus($"Rendering '{normalizedOutputPath}'.");
-                Render(element, normalizedOutputPath!);
-            }
+    /// <summary>
+    /// Executes the requested preview operation.
+    /// </summary>
+    /// <param name="xamlPath">The source XAML path.</param>
+    private static int ExecutePreview(string xamlPath) {
+        string normalizedXamlPath = Path.GetFullPath(xamlPath);
 
+        using WpfDiagnosticsSession diagnostics = StartDiagnosticsSession(normalizedXamlPath);
+
+        try {
+            WriteStatus($"Loading '{normalizedXamlPath}'.");
+            FrameworkElement element = LoadRootElement(normalizedXamlPath);
+            WriteStatus("Opening preview window.");
+            ShowPreviewWindow(element, normalizedXamlPath);
             WriteStatus("Done.");
             return 0;
         }

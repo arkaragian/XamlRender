@@ -46,15 +46,15 @@ It is designed for cases where the XAML is not just loose markup, but belongs to
 Render to a file:
 
 ```powershell
-./XamlRender.exe input.xaml output.png
-./XamlRender.exe input.xaml output.xps
-./XamlRender.exe input.xaml output.svg
+./XamlRender.exe render input.xaml output.png
+./XamlRender.exe render input.xaml output.xps
+./XamlRender.exe render input.xaml output.svg
 ```
 
 Open a preview window:
 
 ```powershell
-./XamlRender.exe input.xaml --preview
+./XamlRender.exe preview input.xaml
 ```
 
 ## Console Output

@@ -37,11 +37,8 @@ This repository contains a WPF renderer prototype that loads a `.xaml` file and 
 - When WPF does not provide file/line information, diagnostics fall back to the input XAML path.
 
 - The CLI shape is currently:
-  - `XamlRender.exe <xaml> <output>`
-  - `XamlRender.exe <xaml> --preview`
-- `output` is optional at the parser level but runtime validation requires either:
-  - an output path, or
-  - `--preview`
+  - `XamlRender.exe render <xaml> <output>`
+  - `XamlRender.exe preview <xaml>`
 
 ## Output Notes
 
