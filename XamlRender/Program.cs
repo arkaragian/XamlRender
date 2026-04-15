@@ -2,8 +2,13 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Xps;
+using System.Windows.Xps.Packaging;
 using System.Xaml;
 using System.Xml;
 using System.Xml.Linq;
@@ -16,23 +21,19 @@ internal static class Program {
     /// <summary>
     /// Entry point for the renderer executable.
     /// </summary>
-    /// <param name="args">Command-line arguments containing the input XAML path and output PNG path.</param>
+    /// <param name="args">Command-line arguments containing the input XAML path and output path.</param>
     [STAThread]
     private static void Main(string[] args) {
         if (args.Length < 2) {
-            Console.WriteLine("Usage: XamlToBitmap.exe input.xaml output.png");
+            Console.WriteLine("Usage: XamlRender.exe input.xaml output.png|output.xps|output.svg");
             return;
         }
 
         string xamlPath = Path.GetFullPath(args[0]);
-        string pngPath = Path.GetFullPath(args[1]);
+        string outputPath = Path.GetFullPath(args[1]);
 
         FrameworkElement element = LoadRootElement(xamlPath);
-
-        int width = 800;
-        int height = 600;
-
-        RenderToPng(element, width, height, pngPath);
+        Render(element, outputPath);
     }
 
     /// <summary>
@@ -471,36 +472,167 @@ internal static class Program {
     }
 
     /// <summary>
-    /// Measures, arranges, and renders a framework element into a PNG file.
+    /// Measures and arranges a framework element using its natural size.
     /// </summary>
     /// <param name="element">The visual root to render.</param>
-    /// <param name="width">The target bitmap width in pixels.</param>
-    /// <param name="height">The target bitmap height in pixels.</param>
-    /// <param name="outputPath">The file path for the generated PNG.</param>
-    private static void RenderToPng(
-        FrameworkElement element,
-        int width,
-        int height,
-        string outputPath
-    ) {
-        element.Measure(new Size(width, height));
+    /// <returns>The measured size that should be used for rendering.</returns>
+    private static Size PrepareElementForRendering(FrameworkElement element) {
+        element.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+
+        Size desiredSize = element.DesiredSize;
+        double width = Math.Max(1, Math.Ceiling(desiredSize.Width));
+        double height = Math.Max(1, Math.Ceiling(desiredSize.Height));
+
         element.Arrange(new Rect(0, 0, width, height));
         element.UpdateLayout();
+
+        return new Size(width, height);
+    }
+
+    /// <summary>
+    /// Computes a raster upscaling factor so small controls remain inspectable when zoomed.
+    /// </summary>
+    /// <param name="renderSize">The natural render size of the element.</param>
+    /// <returns>The scale factor to apply to bitmap rendering.</returns>
+    private static double GetRasterRenderScale(Size renderSize) {
+        const double targetLongestSidePixels = 2400;
+        double longestSide = Math.Max(renderSize.Width, renderSize.Height);
+
+        if (longestSide <= 0) {
+            return 1;
+        }
+
+        return Math.Max(1, targetLongestSidePixels / longestSide);
+    }
+
+    /// <summary>
+    /// Renders a framework element to the output format implied by the output file extension.
+    /// </summary>
+    /// <param name="element">The visual root to render.</param>
+    /// <param name="outputPath">The output file path.</param>
+    private static void Render(FrameworkElement element, string outputPath) {
+        string extension = Path.GetExtension(outputPath);
+
+        if (string.Equals(extension, ".png", StringComparison.OrdinalIgnoreCase)) {
+            RenderToPng(element, outputPath);
+            return;
+        }
+
+        if (string.Equals(extension, ".xps", StringComparison.OrdinalIgnoreCase)) {
+            RenderToXps(element, outputPath);
+            return;
+        }
+
+        if (string.Equals(extension, ".svg", StringComparison.OrdinalIgnoreCase)) {
+            RenderToSvg(element, outputPath);
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Unsupported output format '{extension}'. Supported formats are .png, .xps, and .svg."
+        );
+    }
+
+    /// <summary>
+    /// Renders a framework element to a bitmap using its natural size.
+    /// </summary>
+    /// <param name="element">The visual root to render.</param>
+    /// <returns>The rendered bitmap.</returns>
+    private static RenderTargetBitmap RenderToBitmap(FrameworkElement element) {
+        Size renderSize = PrepareElementForRendering(element);
+        double renderScale = GetRasterRenderScale(renderSize);
+        int width = Math.Max(1, (int)Math.Ceiling(renderSize.Width * renderScale));
+        int height = Math.Max(1, (int)Math.Ceiling(renderSize.Height * renderScale));
+        double dpi = 96 * renderScale;
 
         RenderTargetBitmap bitmap = new(
             width,
             height,
-            96,
-            96,
+            dpi,
+            dpi,
             PixelFormats.Pbgra32
         );
 
         bitmap.Render(element);
+        return bitmap;
+    }
 
+    /// <summary>
+    /// Measures, arranges, and renders a framework element into a PNG file using its natural size.
+    /// </summary>
+    /// <param name="element">The visual root to render.</param>
+    /// <param name="outputPath">The file path for the generated PNG.</param>
+    private static void RenderToPng(FrameworkElement element, string outputPath) {
+        RenderTargetBitmap bitmap = RenderToBitmap(element);
         PngBitmapEncoder encoder = new();
         encoder.Frames.Add(BitmapFrame.Create(bitmap));
 
         using FileStream stream = File.Create(outputPath);
         encoder.Save(stream);
+    }
+
+    /// <summary>
+    /// Measures, arranges, and renders a framework element into an XPS document using its natural size.
+    /// </summary>
+    /// <param name="element">The visual root to render.</param>
+    /// <param name="outputPath">The file path for the generated XPS document.</param>
+    private static void RenderToXps(FrameworkElement element, string outputPath) {
+        Size renderSize = PrepareElementForRendering(element);
+
+        if (File.Exists(outputPath)) {
+            File.Delete(outputPath);
+        }
+
+        using XpsDocument xpsDocument = new(outputPath, FileAccess.ReadWrite);
+        XpsDocumentWriter writer = XpsDocument.CreateXpsDocumentWriter(xpsDocument);
+
+        FixedPage fixedPage = new() {
+            Width = renderSize.Width,
+            Height = renderSize.Height,
+        };
+        fixedPage.Children.Add(element);
+        FixedPage.SetLeft(element, 0);
+        FixedPage.SetTop(element, 0);
+
+        PageContent pageContent = new();
+        ((IAddChild)pageContent).AddChild(fixedPage);
+
+        FixedDocument document = new();
+        document.Pages.Add(pageContent);
+
+        writer.Write(document);
+    }
+
+    /// <summary>
+    /// Renders a framework element into an SVG file by embedding a PNG snapshot in an SVG container.
+    /// </summary>
+    /// <param name="element">The visual root to render.</param>
+    /// <param name="outputPath">The file path for the generated SVG document.</param>
+    private static void RenderToSvg(FrameworkElement element, string outputPath) {
+        RenderTargetBitmap bitmap = RenderToBitmap(element);
+        byte[] pngBytes = EncodeBitmapAsPng(bitmap);
+        string pngBase64 = Convert.ToBase64String(pngBytes);
+
+        string svg = $"""
+            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{bitmap.PixelWidth}" height="{bitmap.PixelHeight}" viewBox="0 0 {bitmap.PixelWidth} {bitmap.PixelHeight}">
+              <image width="{bitmap.PixelWidth}" height="{bitmap.PixelHeight}" xlink:href="data:image/png;base64,{pngBase64}" />
+            </svg>
+            """;
+
+        File.WriteAllText(outputPath, svg);
+    }
+
+    /// <summary>
+    /// Encodes a bitmap into PNG bytes.
+    /// </summary>
+    /// <param name="bitmap">The bitmap to encode.</param>
+    /// <returns>The PNG-encoded byte array.</returns>
+    private static byte[] EncodeBitmapAsPng(BitmapSource bitmap) {
+        PngBitmapEncoder encoder = new();
+        encoder.Frames.Add(BitmapFrame.Create(bitmap));
+
+        using MemoryStream stream = new();
+        encoder.Save(stream);
+        return stream.ToArray();
     }
 }
