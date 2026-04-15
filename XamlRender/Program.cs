@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using System.Runtime.Loader;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -10,7 +9,9 @@ using System.Xml;
 using System.Xml.Linq;
 
 internal static class Program {
-    private static readonly List<ProjectAssemblyLoadContext> LoadedContexts = [];
+    private static readonly HashSet<string> AssemblyProbeDirectories = new(
+        StringComparer.OrdinalIgnoreCase
+    );
 
     /// <summary>
     /// Entry point for the renderer executable.
@@ -52,6 +53,7 @@ internal static class Program {
         }
 
         string assemblyPath = BuildProjectAndGetAssemblyPath(projectPath);
+        InitializeApplicationResources(projectPath, assemblyPath);
         return InstantiateCompiledRoot(assemblyPath, xamlClassName);
     }
 
@@ -244,16 +246,65 @@ internal static class Program {
     }
 
     /// <summary>
+    /// Initializes application-level resources from the owning WPF project before control rendering begins.
+    /// </summary>
+    /// <param name="projectPath">The path to the owning project file.</param>
+    /// <param name="assemblyPath">The path to the built assembly.</param>
+    private static void InitializeApplicationResources(string projectPath, string assemblyPath) {
+        RegisterAssemblyProbeDirectory(assemblyPath);
+        Assembly assembly = LoadAssemblyIntoDefaultContext(assemblyPath);
+        string? appXamlPath = FindApplicationDefinitionPath(projectPath);
+
+        if (appXamlPath is not null) {
+            string? appClassName = TryReadXamlClassName(appXamlPath);
+            if (!string.IsNullOrWhiteSpace(appClassName)) {
+                Type? appType = assembly.GetType(appClassName, throwOnError: false, ignoreCase: false);
+                if (appType is not null && typeof(Application).IsAssignableFrom(appType)) {
+                    Application application = EnsureApplicationInstance(appType);
+                    InvokeInitializeComponentIfPresent(application);
+                    return;
+                }
+            }
+        }
+
+        _ = Application.Current ?? new Application();
+    }
+
+    /// <summary>
+    /// Finds the project application definition file when one is declared.
+    /// </summary>
+    /// <param name="projectPath">The path to the project file.</param>
+    /// <returns>The application definition XAML path, or <see langword="null"/> if none is found.</returns>
+    private static string? FindApplicationDefinitionPath(string projectPath) {
+        XDocument document = XDocument.Load(projectPath);
+        string projectDirectory = Path.GetDirectoryName(projectPath)
+            ?? throw new InvalidOperationException("Project path has no parent directory.");
+
+        XElement? applicationDefinition = document
+            .Descendants()
+            .FirstOrDefault(element => element.Name.LocalName == "ApplicationDefinition");
+
+        string? includePath = applicationDefinition?.Attribute("Include")?.Value;
+        if (!string.IsNullOrWhiteSpace(includePath)) {
+            string explicitPath = Path.GetFullPath(Path.Combine(projectDirectory, includePath));
+            if (File.Exists(explicitPath)) {
+                return explicitPath;
+            }
+        }
+
+        string conventionalPath = Path.Combine(projectDirectory, "App.xaml");
+        return File.Exists(conventionalPath) ? conventionalPath : null;
+    }
+
+    /// <summary>
     /// Loads the compiled assembly and creates an instance of the XAML root type.
     /// </summary>
     /// <param name="assemblyPath">The path to the built assembly.</param>
     /// <param name="xamlClassName">The fully qualified root type name from <c>x:Class</c>.</param>
     /// <returns>The instantiated framework element.</returns>
     private static FrameworkElement InstantiateCompiledRoot(string assemblyPath, string xamlClassName) {
-        ProjectAssemblyLoadContext loadContext = new(assemblyPath);
-        LoadedContexts.Add(loadContext);
-
-        Assembly assembly = loadContext.LoadFromAssemblyPath(assemblyPath);
+        RegisterAssemblyProbeDirectory(assemblyPath);
+        Assembly assembly = LoadAssemblyIntoDefaultContext(assemblyPath);
         Type? rootType = assembly.GetType(xamlClassName, throwOnError: false, ignoreCase: false);
 
         if (rootType is null) {
@@ -270,6 +321,121 @@ internal static class Program {
         }
 
         return element;
+    }
+
+    /// <summary>
+    /// Returns the current application instance or creates one from the provided application type.
+    /// </summary>
+    /// <param name="appType">The compiled application type.</param>
+    /// <returns>The active application instance.</returns>
+    private static Application EnsureApplicationInstance(Type appType) {
+        if (Application.Current is Application currentApplication) {
+            if (!appType.IsInstanceOfType(currentApplication)) {
+                throw new InvalidOperationException(
+                    $"A different application instance is already active: '{currentApplication.GetType().FullName}'."
+                );
+            }
+
+            return currentApplication;
+        }
+
+        object? instance = Activator.CreateInstance(appType);
+        if (instance is not Application application) {
+            throw new InvalidOperationException(
+                $"Type '{appType.FullName}' does not inherit from Application."
+            );
+        }
+
+        return application;
+    }
+
+    /// <summary>
+    /// Calls a generated or user-defined <c>InitializeComponent</c> method when the instance exposes one.
+    /// </summary>
+    /// <param name="instance">The object whose initialization method should be invoked.</param>
+    private static void InvokeInitializeComponentIfPresent(object instance) {
+        MethodInfo? initializeComponent = instance
+            .GetType()
+            .GetMethod(
+                "InitializeComponent",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                types: Type.EmptyTypes,
+                modifiers: null
+            );
+
+        initializeComponent?.Invoke(instance, parameters: null);
+    }
+
+    /// <summary>
+    /// Registers the target assembly output directory so runtime assembly resolution can probe it.
+    /// </summary>
+    /// <param name="assemblyPath">The path to the built assembly.</param>
+    private static void RegisterAssemblyProbeDirectory(string assemblyPath) {
+        string assemblyDirectory = Path.GetDirectoryName(assemblyPath)
+            ?? throw new InvalidOperationException("Assembly path has no parent directory.");
+
+        if (AssemblyProbeDirectories.Count == 0) {
+            AppDomain.CurrentDomain.AssemblyResolve += ResolveAssemblyFromProbeDirectories;
+        }
+
+        AssemblyProbeDirectories.Add(assemblyDirectory);
+    }
+
+    /// <summary>
+    /// Loads an assembly into the default runtime context, reusing an existing load when possible.
+    /// </summary>
+    /// <param name="assemblyPath">The path to the assembly file.</param>
+    /// <returns>The loaded assembly.</returns>
+    private static Assembly LoadAssemblyIntoDefaultContext(string assemblyPath) {
+        string normalizedAssemblyPath = Path.GetFullPath(assemblyPath);
+
+        Assembly? existingAssembly = AppDomain.CurrentDomain
+            .GetAssemblies()
+            .FirstOrDefault(assembly =>
+                !string.IsNullOrWhiteSpace(assembly.Location)
+                && PathsEqual(assembly.Location, normalizedAssemblyPath)
+            );
+
+        if (existingAssembly is not null) {
+            return existingAssembly;
+        }
+
+        return Assembly.LoadFrom(normalizedAssemblyPath);
+    }
+
+    /// <summary>
+    /// Resolves a missing assembly by probing the registered target output directories.
+    /// </summary>
+    /// <param name="sender">The current application domain.</param>
+    /// <param name="args">The resolution request details.</param>
+    /// <returns>The loaded assembly, or <see langword="null"/> when the assembly cannot be resolved.</returns>
+    private static Assembly? ResolveAssemblyFromProbeDirectories(object? sender, ResolveEventArgs args) {
+        AssemblyName requestedAssemblyName = new AssemblyName(args.Name);
+
+        Assembly? alreadyLoaded = AppDomain.CurrentDomain
+            .GetAssemblies()
+            .FirstOrDefault(assembly =>
+                AssemblyName.ReferenceMatchesDefinition(
+                    assembly.GetName(),
+                    requestedAssemblyName
+                )
+            );
+
+        if (alreadyLoaded is not null) {
+            return alreadyLoaded;
+        }
+
+        foreach (string probeDirectory in AssemblyProbeDirectories) {
+            string candidatePath = Path.Combine(probeDirectory, $"{requestedAssemblyName.Name}.dll");
+            if (!File.Exists(candidatePath)) {
+                continue;
+            }
+
+            return Assembly.LoadFrom(candidatePath);
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -336,27 +502,5 @@ internal static class Program {
 
         using FileStream stream = File.Create(outputPath);
         encoder.Save(stream);
-    }
-}
-
-internal sealed class ProjectAssemblyLoadContext : AssemblyLoadContext {
-    private readonly AssemblyDependencyResolver dependencyResolver;
-
-    /// <summary>
-    /// Initializes a load context that resolves dependencies relative to a built project assembly.
-    /// </summary>
-    /// <param name="mainAssemblyPath">The path to the primary assembly whose dependencies should be resolved.</param>
-    public ProjectAssemblyLoadContext(string mainAssemblyPath) : base(isCollectible: false) {
-        dependencyResolver = new AssemblyDependencyResolver(mainAssemblyPath);
-    }
-
-    /// <summary>
-    /// Resolves dependent assemblies using the project output directory.
-    /// </summary>
-    /// <param name="assemblyName">The assembly name being requested.</param>
-    /// <returns>The loaded assembly, or <see langword="null"/> when resolution fails.</returns>
-    protected override Assembly? Load(AssemblyName assemblyName) {
-        string? path = dependencyResolver.ResolveAssemblyToPath(assemblyName);
-        return path is null ? null : LoadFromAssemblyPath(path);
     }
 }
